@@ -26,6 +26,7 @@ NEC remote). Automatic carrier detection through the Palm's receiver is not
 implemented. The bridge targets the supplied OmniRemote Pro 2.x `ORLib.prc`
 A807 interface, and transmit currently targets the D552 (`70 01`) dongle.
 Android's status bar is hidden; swiping can reveal it temporarily.
+Sensor rotation supports all four orientations, including upside-down portrait.
 
 Build prerequisites: Java 17 or 21, Android SDK 36, Emscripten (tested 4.0.18),
 and Node.js/Yarn for Cloudpilot's skin assets. Create ignored `local.properties`
