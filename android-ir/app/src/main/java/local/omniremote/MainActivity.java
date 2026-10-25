@@ -74,6 +74,10 @@ public class MainActivity extends Activity {
             android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::saveAndExit);
         web.loadUrl("https://omniremote.local/index.html");
     }
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+    }
     private void hideStatusBar() {
         if(Build.VERSION.SDK_INT>=30) {
             WindowInsetsController controller=getWindow().getInsetsController();
