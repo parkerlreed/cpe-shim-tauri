@@ -2,6 +2,10 @@
 
 Tauri v2 wrapper for the [CloudpilotEmu PWA](https://cloudpilot-emu.github.io/app).
 
+The experimental [Android USB IR app](android-ir/README.md) embeds a patched
+Cloudpilot core so OmniRemote can learn and transmit through an ElkSmart D552
+dongle using native Android USB transfers. Its build is separate from Tauri.
+
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) (v18+)

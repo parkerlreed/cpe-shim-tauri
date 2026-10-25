@@ -1,0 +1,7 @@
+.gradle/
+build/
+app/build/
+local.properties
+app/src/main/assets/cloudpilot_web.js
+app/src/main/assets/cloudpilot_web.wasm
+app/src/main/assets/session.img

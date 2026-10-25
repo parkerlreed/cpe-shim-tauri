@@ -1,0 +1,518 @@
+diff --git a/src/cloudpilot/Makefile b/src/cloudpilot/Makefile
+index 4f34fa7c..700e43a4 100644
+--- a/src/cloudpilot/Makefile
++++ b/src/cloudpilot/Makefile
+@@ -55,6 +55,7 @@ SOURCE_C = \
+ 	proto/networking.pb.c
+ 
+ SOURCE_CXX = \
++    emulator/patch/PatchModuleOmniRemote.cpp \
+ 	emulator/uae/readcpu.cpp \
+ 	emulator/hardware/EmMemory.cpp \
+ 	emulator/hardware/EmHAL.cpp \
+@@ -232,4 +233,4 @@ emscripten: $(BINARY_EMCC)
+ test: $(BINARY_TEST)
+ 	$(BINARY_TEST)
+ 
+-.PHONY: bin emscripten clean test
+\ No newline at end of file
++.PHONY: bin emscripten clean test
+diff --git a/src/cloudpilot/emulator/hardware/EmBankRegs.cpp b/src/cloudpilot/emulator/hardware/EmBankRegs.cpp
+index 2a152f30..71d04421 100644
+--- a/src/cloudpilot/emulator/hardware/EmBankRegs.cpp
++++ b/src/cloudpilot/emulator/hardware/EmBankRegs.cpp
+@@ -13,15 +13,43 @@
+ 
+ #include "EmBankRegs.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ #include "EmCPU.h"     // GetPC
+ #include "EmCPU68K.h"  // gCPU68K
+ #include "EmCommon.h"
+ #include "EmMemory.h"   // gMemAccessFlags, EmMemory::IsPCInRAM
+ #include "EmSession.h"  // GetDevice, ScheduleDeferredError
++#include "PatchModuleOmniRemote.h"
+ #include "savestate/Savestate.h"
+ #include "savestate/SavestateLoader.h"
+ #include "savestate/SavestateProbe.h"
+ 
++namespace {
++    void TraceIrRegister(emuptr address, unsigned size, uint32 value) {
++        if (PatchModuleOmniRemote::enabled) PatchModuleOmniRemote::RegisterWrite(address, size, value);
++#ifndef __EMSCRIPTEN__
++        // Opt-in diagnostics for applications that bit-bang the IR transmitter.
++        // Byte-oriented serial redirection loses these register transitions.
++        if (!((address >= 0xfffff400 && address < 0xfffff450) ||
++              (address >= 0xfffff900 && address < 0xfffff920))) return;
++        static FILE* output = []() -> FILE* {
++            const char* path = std::getenv("CPE_IR_TRACE");
++            return path && *path ? std::fopen(path, "w") : nullptr;
++        }();
++        if (!output || !gSession || !gCPU68K) return;
++        const uint64 cycles = gSession->GetSystemCycles() + gCPU68K->GetCurrentCycles();
++        std::fprintf(output,
++                     "{\"cycles\":%llu,\"clock_hz\":%u,\"pc\":\"%08x\","
++                     "\"address\":\"%08x\",\"size\":%u,\"value\":%u}\n",
++                     static_cast<unsigned long long>(cycles), gSession->GetClocksPerSecond(),
++                     gCPU68K->GetPC(), address, size, value);
++        std::fflush(output);
++#endif
++    }
++}
++
+ /*
+         When emulating memory, UAE divides up the 4GB address space into
+         65,536 banks, each of which is 64K long.  For more details, see the
+@@ -286,6 +314,7 @@ uint32 EmBankRegs::GetByte(emuptr address) {
+ // ---------------------------------------------------------------------------
+ 
+ void EmBankRegs::SetLong(emuptr address, uint32 value) {
++    TraceIrRegister(address, 4, value);
+     EmRegs* bank = EmBankRegs::GetSubBank(address, sizeof(uint32));
+ 
+     if (bank) {
+@@ -309,6 +338,7 @@ void EmBankRegs::SetLong(emuptr address, uint32 value) {
+ // ---------------------------------------------------------------------------
+ 
+ void EmBankRegs::SetWord(emuptr address, uint32 value) {
++    TraceIrRegister(address, 2, value);
+     EmRegs* bank = EmBankRegs::GetSubBank(address, sizeof(uint16));
+ 
+     if (bank) {
+@@ -332,6 +362,7 @@ void EmBankRegs::SetWord(emuptr address, uint32 value) {
+ // ---------------------------------------------------------------------------
+ 
+ void EmBankRegs::SetByte(emuptr address, uint32 value) {
++    TraceIrRegister(address, 1, value);
+     EmRegs* bank = EmBankRegs::GetSubBank(address, sizeof(uint8));
+ 
+     if (bank) {
+diff --git a/src/cloudpilot/emulator/hardware/EmCPU68K.h b/src/cloudpilot/emulator/hardware/EmCPU68K.h
+index 8c0a36d9..59640273 100644
+--- a/src/cloudpilot/emulator/hardware/EmCPU68K.h
++++ b/src/cloudpilot/emulator/hardware/EmCPU68K.h
+@@ -227,6 +227,7 @@ class EmCPU68K : public EmCPU {
+ 
+     virtual uint32 Execute(uint32 maxCycles);
+     virtual void CheckAfterCycle(void);
++    uint32 GetCurrentCycles() const { return fCurrentCycles; }
+ 
+     // Low-level access to CPU state.
+ 
+diff --git a/src/cloudpilot/emulator/patch/EmPatchMgr.cpp b/src/cloudpilot/emulator/patch/EmPatchMgr.cpp
+index 13577404..1957c660 100644
+--- a/src/cloudpilot/emulator/patch/EmPatchMgr.cpp
++++ b/src/cloudpilot/emulator/patch/EmPatchMgr.cpp
+@@ -28,6 +28,7 @@
+ #include "Miscellaneous.h"
+ #include "PatchModuleClieStubAll.h"
+ #include "PatchModuleNetlib.h"
++#include "PatchModuleOmniRemote.h"
+ #include "PenEvent.h"
+ #include "ROMStubs.h"  // FtrSet, FtrUnregister, EvtWakeup, ...
+ #include "UAE.h"       // gRegs, m68k_dreg, etc.
+@@ -301,6 +302,9 @@ EmPatchModule* EmPatchMgr::GetLibPatchTable(uint16 refNum) {
+ 
+         if (libName == string(PatchModuleNetlib::LIBNAME)) {
+             patchModuleIP = patchModuleNetlib;
++        } else if (libName == "ORLib.prc") {
++            static PatchModuleOmniRemote omniRemote;
++            patchModuleIP = &omniRemote;
+         } else if (gSession->GetDevice().IsClie() &&
+                    PatchModuleClieStubAll::HandlesLibrary(libName)) {
+             patchModuleIP = patchModuleClieStubAll;
+diff --git a/src/cloudpilot/emulator/suspend/SuspendContext.h b/src/cloudpilot/emulator/suspend/SuspendContext.h
+index e300f3fc..477d67a1 100644
+--- a/src/cloudpilot/emulator/suspend/SuspendContext.h
++++ b/src/cloudpilot/emulator/suspend/SuspendContext.h
+@@ -14,7 +14,8 @@ class SuspendContext {
+         clipboardPaste = 2,
+         networkRpc = 3,
+         networkConnect = 4,
+-        serialSync = 5
++        serialSync = 5,
++        irLearn = 6
+     };
+ 
+    public:
+diff --git a/src/cloudpilot/native/Commands.cpp b/src/cloudpilot/native/Commands.cpp
+index 4f1286be..e7a325ab 100644
+--- a/src/cloudpilot/native/Commands.cpp
++++ b/src/cloudpilot/native/Commands.cpp
+@@ -5,6 +5,8 @@
+ #include <iomanip>
+ #include <sstream>
+ #include <unordered_map>
++#include <SDL.h>
++#include <SDL_image.h>
+ 
+ #include "Cli.h"
+ #include "DbBackup.h"
+@@ -14,11 +16,13 @@
+ #include "EmBankSRAM.h"
+ #include "EmCommon.h"
+ #include "EmErrCodes.h"
++#include "EmDevice.h"
+ #include "EmHAL.h"
+ #include "EmMemory.h"
+ #include "EmSession.h"
+ #include "ExternalStorage.h"
+ #include "SessionImage.h"
++#include "ScreenDimensions.h"
+ #include "StackDump.h"
+ #include "ZipfileWalker.h"
+ #include "md5.h"
+@@ -27,6 +31,53 @@
+ using namespace std;
+ 
+ namespace {
++    void CmdScreenshot(vector<string> args, cli::CommandEnvironment& env, void* context) {
++        if (args.size() != 1) return env.PrintUsage();
++        SDL_Renderer* renderer = static_cast<commands::Context*>(context)->renderer;
++        int width, height;
++        if (SDL_GetRendererOutputSize(renderer, &width, &height) != 0) {
++            cout << "screenshot failed: " << SDL_GetError() << endl;
++            return;
++        }
++        unique_ptr<SDL_Surface, decltype(&SDL_FreeSurface)> surface(
++            SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ABGR8888),
++            SDL_FreeSurface);
++        if (!surface || SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ABGR8888,
++                                            surface->pixels, surface->pitch) != 0 ||
++            IMG_SavePNG(surface.get(), args[0].c_str()) != 0) {
++            cout << "screenshot failed: " << SDL_GetError() << endl;
++            return;
++        }
++        cout << "screenshot saved: " << args[0] << endl;
++    }
++
++    void CmdPen(vector<string> args, cli::CommandEnvironment& env, void* context) {
++        if (args.size() == 1 && args[0] == "up") {
++            gSession->QueuePenEvent(PenEvent::up());
++            return;
++        }
++        if (args.size() != 3 || args[0] != "down") return env.PrintUsage();
++        try {
++            size_t usedX, usedY;
++            int x = stoi(args[1], &usedX), y = stoi(args[2], &usedY);
++            ScreenDimensions dimensions(gSession->GetDevice().GetScreenDimensions());
++            if (usedX != args[1].size() || usedY != args[2].size() || x < 0 || y < 0 ||
++                x >= dimensions.Width() || y >= dimensions.Height() + dimensions.SilkscreenHeight())
++                return env.PrintUsage();
++            gSession->QueuePenEvent(PenEvent::down(x, y));
++        } catch (const exception&) { env.PrintUsage(); }
++    }
++
++    void CmdKey(vector<string> args, cli::CommandEnvironment& env, void* context) {
++        if (args.size() != 1) return env.PrintUsage();
++        try {
++            size_t used;
++            unsigned long value = stoul(args[0], &used, 0);
++            if (used != args[0].size() || value > 65535) return env.PrintUsage();
++            gSession->QueueKeyboardEvent(KeyboardEvent(static_cast<uint16>(value)));
++        } catch (const exception&) { env.PrintUsage(); }
++    }
++
+     string translateInstallResult(DbInstaller::Result result) {
+         switch (result) {
+             case DbInstaller::Result::success:
+@@ -488,6 +539,12 @@ namespace {
+     }
+ 
+     const vector<cli::Command> commandList({
++        {.name = "screenshot", .usage = "screenshot <png_file>",
++         .description = "Save the displayed emulator window as PNG.", .cmd = CmdScreenshot},
++        {.name = "pen", .usage = "pen down <x> <y> | pen up",
++         .description = "Queue pen input in Palm screen coordinates.", .cmd = CmdPen},
++        {.name = "key", .usage = "key <character_code>",
++         .description = "Queue a Palm keyboard character (decimal or 0x hex).", .cmd = CmdKey},
+         {
+             .name = "install",
+             .usage = "install <file> [file...]",
+@@ -588,4 +645,4 @@ to app only.)HELP",
+ 
+ }  // namespace
+ 
+-void commands::Register() { cli::AddCommands(commandList); }
+\ No newline at end of file
++void commands::Register() { cli::AddCommands(commandList); }
+diff --git a/src/cloudpilot/native/Commands.h b/src/cloudpilot/native/Commands.h
+index 41e98d2e..f2568abc 100644
+--- a/src/cloudpilot/native/Commands.h
++++ b/src/cloudpilot/native/Commands.h
+@@ -8,10 +8,13 @@
+ #include "Debugger.h"
+ #include "GdbStub.h"
+ 
++struct SDL_Renderer;
++
+ namespace commands {
+     struct Context {
+         Debugger& debugger;
+         GdbStub& gdbStub;
++        SDL_Renderer* renderer;
+     };
+ 
+     void Register();
+diff --git a/src/cloudpilot/native/main.cpp b/src/cloudpilot/native/main.cpp
+index 51e2b393..51dd5596 100644
+--- a/src/cloudpilot/native/main.cpp
++++ b/src/cloudpilot/native/main.cpp
+@@ -217,7 +217,7 @@ void run(const Options& options) {
+ 
+     commands::Register();
+     cli::Start(options.scriptFile);
+-    commands::Context commandContext = {.debugger = gDebugger, .gdbStub = gdbStub};
++    commands::Context commandContext = {.debugger = gDebugger, .gdbStub = gdbStub, .renderer = renderer};
+ 
+     while (mainLoop->IsRunning()) {
+         if (gSession->GetDevice().GetScreenDimensions() != screenDimensionsKind) {
+@@ -229,6 +229,7 @@ void run(const Options& options) {
+ 
+         mainLoop->Cycle();
+ 
++        commandContext.renderer = renderer;
+         if (cli::Execute(&commandContext)) break;
+ 
+         handleSuspend();
+diff --git a/src/cloudpilot/web/Cloudpilot.cpp b/src/cloudpilot/web/Cloudpilot.cpp
+index 2d2c2fdd..fb15f45f 100644
+--- a/src/cloudpilot/web/Cloudpilot.cpp
++++ b/src/cloudpilot/web/Cloudpilot.cpp
+@@ -13,6 +13,7 @@
+ #include "EmSession.h"
+ #include "EmSystemState.h"
+ #include "ExternalStorage.h"
++#include "PatchModuleOmniRemote.h"
+ #include "Feature.h"
+ #include "LogDomain.h"
+ #include "Logging.h"
+@@ -169,6 +170,17 @@ void Cloudpilot::QueuePenMove(int x, int y) { gSession->QueuePenEvent(PenEvent::
+ 
+ void Cloudpilot::QueuePenUp() { gSession->QueuePenEvent(PenEvent::up()); }
+ 
++void Cloudpilot::SetIrBridgeEnabled(bool enabled) { PatchModuleOmniRemote::enabled = enabled; }
++bool Cloudpilot::IsIrLearnPending() { return PatchModuleOmniRemote::IsPending(); }
++int Cloudpilot::GetIrLearnRate() { return PatchModuleOmniRemote::GetRate(); }
++bool Cloudpilot::CompleteIrLearn(void* timings, int count) {
++    return count > 0 && PatchModuleOmniRemote::Complete(static_cast<const uint32*>(timings), count);
++}
++int Cloudpilot::GetIrTransmitSize() { return PatchModuleOmniRemote::TransmitSize(); }
++int Cloudpilot::GetIrTransmitFrequency() { return PatchModuleOmniRemote::TransmitFrequency(); }
++void* Cloudpilot::GetIrTransmitData() { return PatchModuleOmniRemote::TransmitData(); }
++void Cloudpilot::PopIrTransmit() { PatchModuleOmniRemote::PopTransmit(); }
++
+ void Cloudpilot::QueueButtonDown(int id) {
+     gSession->QueueButtonEvent(ButtonEvent(buttonFromId(id), ButtonEvent::Type::press));
+ }
+diff --git a/src/cloudpilot/web/Cloudpilot.h b/src/cloudpilot/web/Cloudpilot.h
+index effc17d2..11c72ea3 100644
+--- a/src/cloudpilot/web/Cloudpilot.h
++++ b/src/cloudpilot/web/Cloudpilot.h
+@@ -27,6 +27,14 @@ class Cloudpilot {
+     int GetCyclesPerSecond();
+     int RunEmulation(int cycles);
+     void SetClockFactor(double clockFactor);
++    void SetIrBridgeEnabled(bool enabled);
++    bool IsIrLearnPending();
++    int GetIrLearnRate();
++    bool CompleteIrLearn(void* timings, int count);
++    int GetIrTransmitSize();
++    int GetIrTransmitFrequency();
++    void* GetIrTransmitData();
++    void PopIrTransmit();
+ 
+     Frame& CopyFrame();
+     bool IsScreenDirty();
+diff --git a/src/cloudpilot/web/binding/cloudpilot.idl b/src/cloudpilot/web/binding/cloudpilot.idl
+index 73ea3b74..df9825b6 100644
+--- a/src/cloudpilot/web/binding/cloudpilot.idl
++++ b/src/cloudpilot/web/binding/cloudpilot.idl
+@@ -12,6 +12,14 @@ interface Cloudpilot {
+     long GetCyclesPerSecond();
+     long RunEmulation(long cycles);
+     void SetClockFactor(double clockFactor);
++    void SetIrBridgeEnabled(boolean enabled);
++    boolean IsIrLearnPending();
++    long GetIrLearnRate();
++    boolean CompleteIrLearn(VoidPtr timings, long count);
++    long GetIrTransmitSize();
++    long GetIrTransmitFrequency();
++    VoidPtr GetIrTransmitData();
++    void PopIrTransmit();
+ 
+     [Ref] Frame CopyFrame();
+     boolean IsScreenDirty();
+diff --git a/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.cpp b/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.cpp
+new file mode 100644
+index 00000000..8cf9cc5b
+--- /dev/null
++++ b/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.cpp
+@@ -0,0 +1,140 @@
++#include "PatchModuleOmniRemote.h"
++
++#include <cmath>
++#include <vector>
++#include <deque>
++#include "EmHAL.h"
++#include "EmCommon.h"
++#include "EmMemory.h"
++#include "Marshal.h"
++#include "SuspendContext.h"
++#include "SuspendManager.h"
++
++bool PatchModuleOmniRemote::enabled = false;
++
++namespace {
++    struct Request {
++        emuptr buffer = 0, length = 0;
++        uint16 capacity = 0;
++        uint32 rate = 0;
++        bool pending = false;
++    } request;
++
++    struct Transmission { unsigned frequency; std::vector<uint32> timings; };
++    std::deque<Transmission> transmitQueue;
++    uint16 uartControl = 0, uartBaud = 0, uartMisc = 0;
++    uint8 portSelect = 0xff;
++    struct Run { bool mark; unsigned samples; };
++    std::vector<Run> runs;
++    double sampleUs = 0, carrierHz = 0;
++    unsigned sampleCount = 0;
++
++    void FinishTransmission() {
++        if (runs.empty()) return;
++        Transmission tx{static_cast<unsigned>(std::lround(carrierHz)), {}};
++        for (unsigned i = runs[0].mark ? 0 : 1; i < runs.size(); ++i)
++            tx.timings.push_back(std::lround(runs[i].samples * sampleUs));
++        if (!tx.timings.empty() && transmitQueue.size() < 8) transmitQueue.push_back(std::move(tx));
++        runs.clear(); sampleCount = 0;
++    }
++
++    void ReturnStatus(uint8 status, uint16 length) {
++        CALLED_SETUP("UInt8", "void");
++        EmMemPut16(request.length, length);
++        PUT_RESULT_VAL(UInt8, status);
++        request.pending = false;
++    }
++
++    class IrLearnContext : public SuspendContext {
++     public:
++        Kind GetKind() const override { return Kind::irLearn; }
++        void Cancel() override { ReturnStatus(2, 0); ResumeExecution(); }
++        void Complete(uint16 length) { ReturnStatus(1, length); ResumeExecution(); }
++    };
++
++    CallROMType RecordSample() {
++        if (!PatchModuleOmniRemote::enabled) return kExecuteROM;
++        // Confirmed against ORLib's dispatch table and the supplied PRC's
++        // callers: A807(refNum, buffer, capacity, &length, baud, offLimit, flags).
++        CALLED_SETUP("UInt8", "UInt16 refNum, UInt32 buffer, UInt16 capacity, "
++                     "UInt32 length, UInt32 rate, UInt16 offLimit, UInt16 flags");
++        CALLED_GET_PARAM_VAL(UInt32, buffer);
++        CALLED_GET_PARAM_VAL(UInt16, capacity);
++        CALLED_GET_PARAM_VAL(UInt32, length);
++        CALLED_GET_PARAM_VAL(UInt32, rate);
++        request = {buffer, length, capacity, rate, true};
++        if (!buffer || !length || capacity < 2 || rate < 1000 || rate > 1000000) {
++            request.pending = false;
++            PUT_RESULT_VAL(UInt8, 0);
++            return kSkipROM;
++        }
++        SuspendManager::Suspend<IrLearnContext>();
++        return kSkipROM;
++    }
++}
++
++PatchModuleOmniRemote::PatchModuleOmniRemote() {
++    static ProtoPatchTableEntry table[] = {{0xa807, RecordSample, nullptr}, {0, nullptr, nullptr}};
++    LoadProtoPatchTable(table);
++}
++
++bool PatchModuleOmniRemote::IsPending() {
++    return request.pending && SuspendManager::IsSuspended() &&
++           SuspendManager::GetContext().GetKind() == SuspendContext::irLearn;
++}
++
++unsigned PatchModuleOmniRemote::GetRate() { return IsPending() ? request.rate : 0; }
++
++bool PatchModuleOmniRemote::Complete(const uint32* timings, unsigned count) {
++    if (!IsPending()) return false;
++    auto& context = static_cast<IrLearnContext&>(SuspendManager::GetContext());
++    if (!timings || count < 6 || count > 100000) { context.Cancel(); return false; }
++    // ORLib stores an initial 0x01 byte, followed by MSB-first envelope bits.
++    // One bit is a ten-bit UART frame, hence five carrier cycles at baud/2.
++    std::vector<uint8> result(request.capacity, 0);
++    result[0] = 1;
++    uint64 totalUs = 0;
++    unsigned previousBit = 0;
++    for (unsigned i = 0; i < count; ++i) {
++        if (!timings[i] || timings[i] > 2000000 || totalUs + timings[i] > 10000000) {
++            context.Cancel(); return false;
++        }
++        totalUs += timings[i];
++        const auto end = static_cast<unsigned>(std::llround(totalUs * request.rate / 10000000.0));
++        if (1 + (end + 7) / 8 > result.size()) { context.Cancel(); return false; }
++        if (!(i & 1)) {
++            for (unsigned bit = previousBit; bit < end; ++bit)
++                result[1 + bit / 8] |= 0x80 >> (bit % 8);
++        }
++        previousBit = end;
++    }
++    const unsigned length = 1 + (previousBit + 7) / 8;
++    EmMem_memcpy(request.buffer, static_cast<const void*>(result.data()), length);
++    context.Complete(length);
++    return true;
++}
++
++void PatchModuleOmniRemote::RegisterWrite(emuptr address, unsigned size, uint32 value) {
++    if (!enabled) return;
++    if (address == 0xfffff423 && size == 1) portSelect = value;
++    if (address == 0xfffff900 || address == 0xfffff902 || address == 0xfffff908) {
++        FinishTransmission();
++        if (address == 0xfffff900) uartControl = value;
++        if (address == 0xfffff902) uartBaud = value;
++        if (address == 0xfffff908) uartMisc = value;
++    }
++    if (address != 0xfffff906 || size != 2 || value != 0x0855 ||
++        (uartControl & 0xa100) != 0xa100 || (uartControl & 0x0a00) || (uartMisc & 0x20)) return;
++    const double baud = static_cast<double>(EmHAL::GetSystemClockFrequency()) /
++                        (65 - (uartBaud & 63)) / (1 << ((uartBaud >> 8) & 7)) / 16;
++    if (runs.empty()) { sampleUs = 10000000.0 / baud; carrierHz = baud / 2; }
++    const bool mark = !(portSelect & 0x20);
++    if (sampleCount++ >= 100000) { runs.clear(); sampleCount = 0; return; }
++    if (!runs.empty() && runs.back().mark == mark) ++runs.back().samples;
++    else runs.push_back({mark, 1});
++}
++
++unsigned PatchModuleOmniRemote::TransmitSize() { return transmitQueue.empty() ? 0 : transmitQueue.front().timings.size(); }
++unsigned PatchModuleOmniRemote::TransmitFrequency() { return transmitQueue.empty() ? 0 : transmitQueue.front().frequency; }
++void* PatchModuleOmniRemote::TransmitData() { return transmitQueue.empty() ? nullptr : transmitQueue.front().timings.data(); }
++void PatchModuleOmniRemote::PopTransmit() { if (!transmitQueue.empty()) transmitQueue.pop_front(); }
+diff --git a/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.h b/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.h
+new file mode 100644
+index 00000000..788a2c26
+--- /dev/null
++++ b/src/cloudpilot/emulator/patch/PatchModuleOmniRemote.h
+@@ -0,0 +1,19 @@
++#ifndef PATCH_MODULE_OMNIREMOTE_H
++#define PATCH_MODULE_OMNIREMOTE_H
++#include "EmPatchModule.h"
++
++// Opt-in bridge for ORLibRecordSample in OmniRemote Pro 2.x.
++class PatchModuleOmniRemote : public EmPatchModule {
++ public:
++    PatchModuleOmniRemote();
++    static bool enabled;
++    static bool IsPending();
++    static unsigned GetRate();
++    static bool Complete(const uint32* timings, unsigned count);
++    static void RegisterWrite(emuptr address, unsigned size, uint32 value);
++    static unsigned TransmitSize();
++    static unsigned TransmitFrequency();
++    static void* TransmitData();
++    static void PopTransmit();
++};
++#endif

@@ -1,0 +1,2 @@
+# Unified diff context includes required leading spaces and Makefile tabs.
+patches/*.patch -whitespace

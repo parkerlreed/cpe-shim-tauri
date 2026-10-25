@@ -1,0 +1,136 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>OmniRemote IR Test</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#18202a;color:#f3f5f7;font:16px system-ui;display:flex;flex-direction:column;align-items:center;min-height:100dvh;padding:12px;gap:10px}h1{font-size:19px;margin:2px 0}#status{min-height:40px;text-align:center;max-width:600px;font-size:14px}.palm{width:min(94vw,calc((100dvh - 160px)*162/253));padding:1px;background:#fff;box-shadow:0 4px 24px #0006;border-radius:2px}#pen-surface{touch-action:none;user-select:none;-webkit-user-select:none}canvas{display:block;width:100%;height:auto;aspect-ratio:1;image-rendering:pixelated;background:#ddd}.separator{aspect-ratio:160/1;background:#ccc}.skin{display:block;width:100%;height:auto;pointer-events:none;user-select:none}#hard-buttons{position:relative;aspect-ratio:160/30;touch-action:none}.buttons{display:flex;gap:12px}button{font:inherit;border:0;border-radius:8px;padding:10px 18px;background:#425d7b;color:white}.hardware-button{position:absolute;margin:0;padding:0;border-radius:0;background:transparent;color:transparent;touch-action:none;user-select:none}.hardware-button.pressed{background:#0003}.hardware-button:focus-visible{outline:2px solid #4d8ce4;outline-offset:-2px}#cancel{background:#85413d}
+.hardware-button{top:0}
+body{padding:0;gap:0;justify-content:center;height:100dvh;min-height:0;overflow:hidden;background:#18202a}
+.palm{width:min(100vw,calc(100dvh*160/251));padding:0;box-shadow:none;border-radius:0;background:transparent}
+#status{position:fixed;z-index:2;bottom:12px;left:50%;transform:translateX(-50%);width:max-content;max-width:90vw;min-height:0;padding:10px 14px;border-radius:8px;background:#18202aee;box-shadow:0 2px 12px #0004;pointer-events:none}
+</style>
+<div id="status" role="status">Loading Palm…</div>
+<div class="palm" aria-label="Palm m130">
+ <div id="pen-surface">
+  <canvas id="screen" width="160" height="160" aria-label="Palm screen"></canvas>
+  <div class="separator"></div>
+  <img class="skin" src="silkscreen-m130.svg" draggable="false" alt="Palm Graffiti area with Home, Menu, Calculator and Find controls">
+ </div>
+ <div id="hard-buttons">
+  <img class="skin" src="hard-buttons-m130.svg" draggable="false" alt="Palm application and scroll buttons">
+  <button class="hardware-button" data-palm-button="0" aria-label="Calendar" style="left:0;width:18.75%;height:100%"></button>
+  <button class="hardware-button" data-palm-button="1" aria-label="Address book" style="left:18.75%;width:18.75%;height:100%"></button>
+  <button class="hardware-button" data-palm-button="4" aria-label="Scroll up" style="left:37.5%;width:25%;height:50%;top:0"></button>
+  <button class="hardware-button" data-palm-button="5" aria-label="Scroll down" style="left:37.5%;width:25%;height:50%;top:50%"></button>
+  <button class="hardware-button" data-palm-button="2" aria-label="To Do" style="left:62.5%;width:18.75%;height:100%"></button>
+  <button class="hardware-button" data-palm-button="3" aria-label="Memo Pad" style="left:81.25%;width:18.75%;height:100%"></button>
+ </div>
+</div>
+<script src="cloudpilot_web.js"></script>
+<script>
+'use strict';
+let M,cp,learning=false,started=false,exitRequested=false,statusTimer;
+const screen=document.querySelector('#screen'),ctx=screen.getContext('2d'),status=document.querySelector('#status'),penSurface=document.querySelector('#pen-surface');
+const message=(s,persistent=false)=>{clearTimeout(statusTimer);status.textContent=s;status.hidden=!s;if(s&&!persistent)statusTimer=setTimeout(()=>status.hidden=true,2600);};
+const ptr=n=>M.wrapPointer(n,M.VoidPtr);
+const address=o=>M.getPointer(o);
+function copyIn(bytes){const p=cp.Malloc(bytes.length);M.HEAPU8.set(bytes,address(p));return p;}
+function copyOut(p,n){return M.HEAPU8.slice(address(p),address(p)+n);}
+function draw(){
+ if(!cp.IsScreenDirty())return;
+ const f=cp.CopyFrame(),w=f.GetLineWidth(),h=f.GetLines(),bpp=f.GetBpp(),stride=f.GetBytesPerLine(),margin=f.GetMargin(),base=address(f.GetBuffer());
+ if(!w||!h)return;
+ if(screen.width!==w||screen.height!==h){screen.width=w;screen.height=h;}
+ const img=ctx.createImageData(w,h),a=img.data,raw=M.HEAPU8;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+  const i=(y*w+x)*4,j=base+y*stride;
+  if(bpp===24){const k=j+4*(x+margin);a[i]=raw[k];a[i+1]=raw[k+1];a[i+2]=raw[k+2];}
+  else if(bpp===16){const k=j+2*(x+margin),v=raw[k]|raw[k+1]<<8;a[i]=(v>>11)*255/31;a[i+1]=((v>>5)&63)*255/63;a[i+2]=(v&31)*255/31;}
+  else {const bit=(x+margin)*bpp,mask=(1<<bpp)-1,v=(raw[j+(bit>>3)]>>(8-bpp-(bit&7)))&mask;a[i]=a[i+1]=a[i+2]=255-v*255/mask;}
+  a[i+3]=255;
+ }
+ ctx.putImageData(img,0,0);cp.MarkScreenClean();
+}
+function tick(){
+ try{
+  if(!cp.IsSuspended())cp.RunEmulation(Math.round(cp.GetCyclesPerSecond()/60));
+  draw();
+  while(cp.GetIrTransmitSize()>0){
+   const n=cp.GetIrTransmitSize(),frequency=cp.GetIrTransmitFrequency();
+   const pattern=Array.from(M.HEAPU32.subarray(address(cp.GetIrTransmitData())>>>2,(address(cp.GetIrTransmitData())>>>2)+n));
+   cp.PopIrTransmit();
+   AndroidIR.transmit(frequency,JSON.stringify(pattern));
+  }
+  if(cp.IsIrLearnPending()&&!learning){
+   learning=true;
+   message('Learning: allow USB access, then point your remote at the dongle and press the button.',true);
+   console.log('OmniRemote requested learning; sample baud='+cp.GetIrLearnRate());
+   AndroidIR.learn();
+  }
+ }catch(e){message('Emulator error: '+e.message);console.error(e);return;}
+ requestAnimationFrame(tick);
+}
+window.irCaptureComplete=function(result){
+ if(!learning||!cp.IsIrLearnPending())return;
+ if(result.error){cp.GetSuspendContext().Cancel();message(result.error);}
+ else{
+  const p=cp.Malloc(result.timings.length*4);
+  M.HEAPU32.set(result.timings,address(p)>>>2);
+  const ok=cp.CompleteIrLearn(p,result.timings.length);cp.Free(p);
+  message(ok?'Captured '+result.timings.length+' durations. OmniRemote is finishing training.':'The capture did not fit OmniRemote’s training buffer.');
+  console.log('Native capture delivered to OmniRemote: '+ok);
+ }
+ learning=false;
+ if(exitRequested)requestAnimationFrame(()=>save());
+};
+window.irTransmitComplete=error=>{if(error&&!learning)message(error);};
+let penPointer;
+function pen(e){
+ const r=penSurface.getBoundingClientRect();
+ const x=Math.max(0,Math.min(159,Math.floor((e.clientX-r.left)*160/r.width)));
+ let y=(e.clientY-r.top)*221/r.height;
+ if(y>=160)y=Math.max(160,y-1);
+ cp.QueuePenMove(x,Math.max(0,Math.min(219,Math.floor(y))));
+}
+penSurface.addEventListener('pointerdown',e=>{if(!started||learning||penPointer!==undefined)return;e.preventDefault();penPointer=e.pointerId;penSurface.setPointerCapture(e.pointerId);pen(e);});
+penSurface.addEventListener('pointermove',e=>{if(started&&!learning&&penPointer===e.pointerId)pen(e);});
+function releasePen(e){if(penPointer!==e.pointerId)return;penPointer=undefined;if(started)cp.QueuePenUp();}
+for(const event of ['pointerup','pointercancel','lostpointercapture'])penSurface.addEventListener(event,releasePen);
+for(const button of document.querySelectorAll('[data-palm-button]')){
+ const id=Number(button.dataset.palmButton);let pointer;
+ button.addEventListener('pointerdown',e=>{if(!started||learning||pointer!==undefined)return;e.preventDefault();pointer=e.pointerId;button.setPointerCapture(pointer);button.classList.add('pressed');cp.QueueButtonDown(id);});
+ const release=e=>{if(pointer!==e.pointerId)return;pointer=undefined;button.classList.remove('pressed');if(started)cp.QueueButtonUp(id);};
+ for(const event of ['pointerup','pointercancel','lostpointercapture'])button.addEventListener(event,release);
+}
+function save(){
+ if(!started||learning||cp.IsSuspended())return;
+ if(!cp.SaveState()){AndroidIR.saveAborted();return;}
+ const image=new M.SessionImage();
+ image.SetDeviceId('PalmM130');image.SetRomImage(cp.GetRomPtr(),cp.GetRomSize());image.SetMemoryImage(cp.GetMemoryPtr(),cp.GetMemorySize());image.SetSavestate(cp.GetSavestatePtr(),cp.GetSavestateSize());
+ if(!image.Serialize()){M.destroy(image);AndroidIR.saveAborted();return;}
+ const data=copyOut(image.GetSerializedImage(),image.GetSerializedImageSize());
+ let binary='';for(let i=0;i<data.length;i+=8192)binary+=String.fromCharCode(...data.subarray(i,i+8192));
+ AndroidIR.save(btoa(binary));M.destroy(image);
+}
+window.saved=()=>message('Palm state saved');
+window.saveFailed=()=>{exitRequested=false;message('Could not save Palm state. Press Back to retry.',true);};
+window.requestExit=()=>{
+ if(!started)return false;
+ exitRequested=true;
+ if(learning){AndroidIR.cancel();return true;}
+ if(cp.IsSuspended())cp.GetSuspendContext().Cancel();
+ save();return true;
+};
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&!exitRequested)save();});
+(async()=>{
+ M=await createModule({print:console.log,printErr:console.error});cp=new M.Cloudpilot();
+ const bytes=new Uint8Array(await(await fetch('session.img')).arrayBuffer()),p=copyIn(bytes),image=new M.SessionImage();
+ if(!image.Deserialize(p,bytes.length))throw Error('Invalid session image');
+ const rom=copyOut(image.GetRomImage(),image.GetRomImageSize()),romPtr=copyIn(rom);
+ if(!cp.InitializeSession(romPtr,rom.length,image.GetDeviceId()))throw Error('Palm initialization failed');
+ if(!cp.ImportMemoryImage(image.GetMemoryImage(),image.GetMemoryImageSize()))throw Error('Palm memory restore failed');
+ if(!cp.LoadState(image.GetSavestate(),image.GetSavestateSize()))throw Error('Palm state restore failed');
+ M.destroy(image);cp.Free(p);cp.SetIrBridgeEnabled(true);cp.SetClipboardIntegration(false);cp.SetNetworkRedirection(false);
+ cp.LaunchAppByName('Remote');started=true;message('Ready. Choose Internal IR.');requestAnimationFrame(tick);
+})().catch(e=>{message(e.message);console.error(e);});
+</script>
